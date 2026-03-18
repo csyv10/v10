@@ -32,6 +32,9 @@ from spreadcapture.config import (
     INVENTORY_SKEW,
     MIN_PRICE,
     MAX_PRICE,
+    SELL_SIDE_ENABLED,
+    MIN_INVENTORY_TO_SELL,
+    ASK_OFFSET_MULTIPLIER,
 )
 
 if TYPE_CHECKING:
@@ -45,14 +48,21 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class QuoteSignal:
-    """Result of a strategy evaluation – represents a pair of passive bids."""
+    """Result of a strategy evaluation – represents both bid and ask quotes."""
+    # Bid side (passive buys)
     quote_up: float      # bid price for UP side
     quote_down: float    # bid price for DOWN side
     size_up: int         # shares to bid on UP
     size_down: int       # shares to bid on DOWN
-    spread: float        # captured spread = 1.0 − quote_up − quote_down
-    mid_up: float        # current mid of UP orderbook
-    mid_down: float      # current mid of DOWN orderbook
+    # Ask side (passive sells of existing inventory)
+    ask_up: float = 0.0       # ask price to sell UP shares
+    ask_down: float = 0.0     # ask price to sell DOWN shares
+    size_ask_up: int = 0      # shares to offer on UP ask
+    size_ask_down: int = 0    # shares to offer on DOWN ask
+    # Metrics
+    spread: float = 0.0       # captured bid spread = 1.0 − quote_up − quote_down
+    mid_up: float = 0.0       # current mid of UP orderbook
+    mid_down: float = 0.0     # current mid of DOWN orderbook
 
     @property
     def combined_cost(self) -> float:
@@ -63,7 +73,9 @@ class QuoteSignal:
         """Extra profit above break-even."""
         return self.spread - TARGET_SPREAD
 
-
+    @property
+    def has_asks(self) -> bool:
+        return self.size_ask_up > 0 or self.size_ask_down > 0
 class SpreadCaptureStrategy:
     def __init__(self, tracker: "PositionTracker", risk: "SpreadCaptureRiskManager") -> None:
         self._tracker = tracker
@@ -138,11 +150,29 @@ class SpreadCaptureStrategy:
             )
             return None
 
-        # ── Size calculation ──────────────────────────────────────────────
+        # ── Bid size calculation ──────────────────────────────────────────
         size_up = min(ORDER_SIZE, max(0, MAX_INVENTORY - inv_up))
         size_down = min(ORDER_SIZE, max(0, MAX_INVENTORY - inv_down))
 
-        if size_up == 0 and size_down == 0:
+        # ── Ask (sell) quotes – symmetric above mid ───────────────────────
+        # The bid pulled the quote below mid by bid_offset; the ask goes
+        # the same distance above mid (optionally scaled by ASK_OFFSET_MULTIPLIER).
+        bid_offset_up = mid_up - quote_up
+        bid_offset_down = mid_down - quote_down
+
+        ask_up_raw = mid_up + bid_offset_up * ASK_OFFSET_MULTIPLIER
+        ask_down_raw = mid_down + bid_offset_down * ASK_OFFSET_MULTIPLIER
+
+        ask_up = round(min(0.99, max(mid_up + 0.01, ask_up_raw)), 2)
+        ask_down = round(min(0.99, max(mid_down + 0.01, ask_down_raw)), 2)
+
+        if SELL_SIDE_ENABLED:
+            size_ask_up = min(ORDER_SIZE, inv_up) if inv_up >= MIN_INVENTORY_TO_SELL else 0
+            size_ask_down = min(ORDER_SIZE, inv_down) if inv_down >= MIN_INVENTORY_TO_SELL else 0
+        else:
+            size_ask_up = size_ask_down = 0
+
+        if size_up == 0 and size_down == 0 and size_ask_up == 0 and size_ask_down == 0:
             return None
 
         return QuoteSignal(
@@ -150,6 +180,10 @@ class SpreadCaptureStrategy:
             quote_down=quote_down,
             size_up=size_up,
             size_down=size_down,
+            ask_up=ask_up,
+            ask_down=ask_down,
+            size_ask_up=size_ask_up,
+            size_ask_down=size_ask_down,
             spread=1.0 - quote_up - quote_down,
             mid_up=mid_up,
             mid_down=mid_down,

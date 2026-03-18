@@ -107,12 +107,14 @@ body{background:var(--bg);color:var(--text);font-family:'Cascadia Code',Consolas
 #fills-box{background:var(--surface);border-top:1px solid var(--border)}
 .box-header{display:flex;justify-content:space-between;align-items:center;padding:6px 12px;border-bottom:1px solid var(--border)}
 .box-title{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--muted)}
-.fill-row{display:grid;grid-template-columns:70px 80px 80px 1fr;padding:4px 12px;border-bottom:1px solid rgba(48,54,61,.4);font-size:12px;align-items:center}
+.fill-row{display:grid;grid-template-columns:55px 55px 100px 1fr;padding:4px 12px;border-bottom:1px solid rgba(48,54,61,.4);font-size:12px;align-items:center}
 .fill-side-up{color:var(--green);font-weight:bold}
 .fill-side-dn{color:var(--red);font-weight:bold}
 .fill-price{font-weight:bold}
 .fill-time{color:var(--muted);font-size:11px}
 .fill-profit{text-align:right}
+.fill-direction-buy{color:var(--purple);font-size:10px;font-weight:bold}
+.fill-direction-sell{color:var(--yellow);font-size:10px;font-weight:bold}
 
 /* ── Log ── */
 #log-panel{border-top:1px solid var(--border);background:var(--bg);display:flex;flex-direction:column;height:140px}
@@ -192,12 +194,14 @@ body{background:var(--bg);color:var(--text);font-family:'Cascadia Code',Consolas
 
 <!-- Active quote banner -->
 <div id="quote-banner">
-  <span id="qb-spread-info"><span class="qb-label">Active Quote</span><span class="qb-val" id="qb-quote">—</span></span>
+  <span><span class="qb-label">BID</span><span class="qb-val" id="qb-bid">—</span></span>
+  <span><span class="qb-label">ASK</span><span class="qb-val" id="qb-ask">—</span></span>
   <span><span class="qb-label">Spread</span><span class="qb-val" id="qb-spread">—</span></span>
   <span><span class="qb-label">Edge</span><span class="qb-val" id="qb-edge">—</span></span>
   <span><span class="qb-label">Next refresh</span><span class="qb-val" id="qb-refresh">—</span></span>
   <span style="flex:1"></span>
   <span><span class="qb-label">Inventory</span><span class="qb-val" id="qb-inventory">UP:0 DN:0</span></span>
+  <span><span class="qb-label">Sold</span><span class="qb-val" id="qb-sold">UP:0 DN:0</span></span>
 </div>
 
 <!-- Stats -->
@@ -310,6 +314,28 @@ body{background:var(--bg);color:var(--text);font-family:'Cascadia Code',Consolas
       <div class="s-row">
         <label class="s-label">Max Loss ($)</label>
         <input class="s-input" type="number" id="s-maxloss" step="1" min="1">
+      </div>
+    </div>
+  </div>
+  <div class="s-section">
+    <div class="s-title">Sell-Side Parameters</div>
+    <div class="s-grid2">
+      <div class="s-row">
+        <label class="s-label">Sell-Side Enabled</label>
+        <select class="s-input" id="s-sellside">
+          <option value="true">Enabled</option>
+          <option value="false">Disabled</option>
+        </select>
+      </div>
+      <div class="s-row">
+        <label class="s-label">Min Inventory to Sell</label>
+        <input class="s-input" type="number" id="s-mininvsell" step="1" min="1">
+        <div class="s-hint">Min shares held before posting asks</div>
+      </div>
+      <div class="s-row">
+        <label class="s-label">Ask Offset Multiplier</label>
+        <input class="s-input" type="number" id="s-askoffset" step="0.1" min="0.1" max="3">
+        <div class="s-hint">1.0 = symmetric around mid</div>
       </div>
     </div>
   </div>
@@ -469,12 +495,15 @@ function applyState(s) {
   info += '<div class="isect"><div class="isect-title">PnL</div>';
   info += irow('Unrealised',  `<span class="${pnlCls(s.pnl.unrealised)} bold">${pnlStr(s.pnl.unrealised)}</span>`);
   info += irow('Realised',    `<span class="${pnlCls(s.pnl.realised)} bold">${pnlStr(s.pnl.realised)}</span>`);
+  info += irow('Sell PnL',    `<span class="${pnlCls(s.pnl.sell_realized||0)} bold">${pnlStr(s.pnl.sell_realized||0)}</span>`);
   info += irow('Session',     `<span class="${pnlCls(s.pnl.total)} bold">${pnlStr(s.pnl.total)}</span>`);
   info += irow('Fills',       `<span class="bold">${s.total_fills}</span>`);
   info += '</div>';
   info += '<div class="isect"><div class="isect-title">Position</div>';
   info += irow('UP shares',  `<span class="green bold">${s.positions.up_shares}</span>`);
   info += irow('DN shares',  `<span class="red bold">${s.positions.down_shares}</span>`);
+  if (s.positions.up_shares_sold)   info += irow('UP sold', `<span class="green">${s.positions.up_shares_sold}</span>`);
+  if (s.positions.down_shares_sold) info += irow('DN sold', `<span class="red">${s.positions.down_shares_sold}</span>`);
   if (s.positions.avg_up_price) info += irow('Avg UP', `<span class="green">${s.positions.avg_up_price.toFixed(4)}</span>`);
   if (s.positions.avg_down_price) info += irow('Avg DN', `<span class="red">${s.positions.avg_down_price.toFixed(4)}</span>`);
   info += '</div>';
@@ -490,16 +519,23 @@ function applyState(s) {
 
   // Quote banner
   if (q) {
-    $('qb-quote').innerHTML = `<span class="purple">UP@${q.quote_up.toFixed(3)}×${q.size_up}</span> / <span class="yellow">DN@${q.quote_down.toFixed(3)}×${q.size_down}</span>`;
+    $('qb-bid').innerHTML = `<span class="purple">UP@${q.quote_up.toFixed(3)}\xd7${q.size_up}</span> / <span class="yellow">DN@${q.quote_down.toFixed(3)}\xd7${q.size_down}</span>`;
+    if (q.has_asks) {
+      $('qb-ask').innerHTML = `<span class="green">UP@${q.ask_up.toFixed(3)}\xd7${q.size_ask_up}</span> / <span class="red">DN@${q.ask_down.toFixed(3)}\xd7${q.size_ask_down}</span>`;
+    } else {
+      $('qb-ask').innerHTML = `<span class="muted">\u2014</span>`;
+    }
     const spd = (1 - q.quote_up - q.quote_down);
     $('qb-spread').innerHTML = `<span class="${spd >= _targetSpread ? 'green' : 'red'}">${spd.toFixed(4)}</span>`;
     $('qb-edge').innerHTML = `<span class="green">${(spd - _targetSpread).toFixed(4)}</span>`;
   } else {
-    $('qb-quote').innerHTML = `<span class="muted">—</span>`;
-    $('qb-spread').textContent = '—';
-    $('qb-edge').textContent = '—';
+    $('qb-bid').innerHTML = `<span class="muted">\u2014</span>`;
+    $('qb-ask').innerHTML = `<span class="muted">\u2014</span>`;
+    $('qb-spread').textContent = '\u2014';
+    $('qb-edge').textContent = '\u2014';
   }
   $('qb-inventory').innerHTML = `<span class="green">UP:${s.positions.up_shares}</span> <span class="red">DN:${s.positions.down_shares}</span>`;
+  $('qb-sold').innerHTML = `<span class="green">UP:${s.positions.up_shares_sold||0}</span> <span class="red">DN:${s.positions.down_shares_sold||0}</span>`;
   $('qb-refresh').textContent = s.next_refresh_ms != null ? `${Math.round(s.next_refresh_ms)}ms` : '—';
 
   // Stats
@@ -524,9 +560,12 @@ function applyState(s) {
   const fills = s.recent_fills || [];
   if (fills.length) {
     $('fills-body').innerHTML = fills.map(f => {
-      const cls = f.side === 'UP' ? 'fill-side-up' : 'fill-side-dn';
+      const sideCls = f.side === 'UP' ? 'fill-side-up' : 'fill-side-dn';
+      const dirCls  = f.direction === 'SELL' ? 'fill-direction-sell' : 'fill-direction-buy';
+      const dirLabel = f.direction === 'SELL' ? 'SELL' : 'BUY';
       return `<div class="fill-row">
-        <span class="${cls}">${f.side}</span>
+        <span class="${sideCls}">${f.side}</span>
+        <span class="${dirCls}">${dirLabel}</span>
         <span class="fill-price">${f.shares}sh @ ${f.price.toFixed(4)}</span>
         <span class="fill-time">${esc(f.time)}</span>
       </div>`;
@@ -560,6 +599,9 @@ async function loadSettings() {
     $('s-maxprice').value  = s.max_price        ?? 1;
     $('s-stop').value      = s.stop_before_end_ms ?? 30000;
     $('s-maxloss').value   = s.max_loss         ?? 50;
+    $('s-sellside').value   = String(s.sell_side_enabled ?? true);
+    $('s-mininvsell').value = s.min_inventory_to_sell ?? 1;
+    $('s-askoffset').value  = s.ask_offset_multiplier ?? 1.0;
   } catch {}
 }
 
@@ -577,7 +619,10 @@ async function saveSettings() {
       min_price:           parseFloat($('s-minprice').value),
       max_price:           parseFloat($('s-maxprice').value),
       stop_before_end_ms:  parseInt($('s-stop').value),
-      max_loss:            parseFloat($('s-maxloss').value),
+      max_loss:             parseFloat($('s-maxloss').value),
+      sell_side_enabled:    $('s-sellside').value === 'true',
+      min_inventory_to_sell: parseInt($('s-mininvsell').value),
+      ask_offset_multiplier: parseFloat($('s-askoffset').value),
     };
     const r = await fetch('/api/spread/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
     const d = await r.json();
@@ -653,26 +698,34 @@ def _build_state(engine: SpreadCaptureEngine, next_refresh_ms: float) -> dict:
     quote_dict = None
     if q is not None:
         quote_dict = {
-            "quote_up":   q.quote_up,
-            "quote_down": q.quote_down,
-            "size_up":    q.size_up,
-            "size_down":  q.size_down,
-            "spread":     q.spread,
+            "quote_up":      q.quote_up,
+            "quote_down":    q.quote_down,
+            "size_up":       q.size_up,
+            "size_down":     q.size_down,
+            "spread":        q.spread,
+            "ask_up":        q.ask_up,
+            "ask_down":      q.ask_down,
+            "size_ask_up":   q.size_ask_up,
+            "size_ask_down": q.size_ask_down,
+            "has_asks":      q.has_asks,
         }
 
     positions = {
-        "up_shares":       pos.up_shares,
-        "down_shares":     pos.down_shares,
-        "avg_up_price":    pos.avg_up_price,
-        "avg_down_price":  pos.avg_down_price,
-        "avg_sum":         pos.avg_sum,
-        "share_delta_pct": pos.share_delta_pct,
+        "up_shares":        pos.up_shares,
+        "down_shares":      pos.down_shares,
+        "up_shares_sold":   pos.up_shares_sold,
+        "down_shares_sold": pos.down_shares_sold,
+        "avg_up_price":     pos.avg_up_price,
+        "avg_down_price":   pos.avg_down_price,
+        "avg_sum":          pos.avg_sum,
+        "share_delta_pct":  pos.share_delta_pct,
     }
 
     from spreadcapture.config import (
         TARGET_SPREAD, ORDER_SIZE, MAX_INVENTORY, REFRESH_INTERVAL_MS,
         EDGE_THRESHOLD, INVENTORY_SKEW, MIN_PRICE, MAX_PRICE,
         STOP_BEFORE_END_MS, MAX_LOSS,
+        SELL_SIDE_ENABLED, MIN_INVENTORY_TO_SELL, ASK_OFFSET_MULTIPLIER,
     )
 
     return {
@@ -683,10 +736,11 @@ def _build_state(engine: SpreadCaptureEngine, next_refresh_ms: float) -> dict:
         "is_paused":    engine.risk.is_halted and "Paused" in engine.risk.halt_reason,
         "halt_reason":  engine.risk.halt_reason,
         "pnl": {
-            "unrealised": engine.tracker.unrealised_pnl,
-            "realised":   engine.tracker.realised_pnl,
-            "total":      engine.tracker.total_pnl,
-            "trade_count": engine.tracker.trade_count,
+            "unrealised":    engine.tracker.unrealised_pnl,
+            "realised":      engine.tracker.realised_pnl,
+            "sell_realized": engine.tracker.sell_realized_pnl,
+            "total":         engine.tracker.total_pnl,
+            "trade_count":   engine.tracker.trade_count,
         },
         "positions":    positions,
         "market":       market_info,
@@ -698,16 +752,19 @@ def _build_state(engine: SpreadCaptureEngine, next_refresh_ms: float) -> dict:
         "logs":         list(engine.log_lines),
         "next_refresh_ms": next_refresh_ms,
         "config": {
-            "target_spread":       TARGET_SPREAD,
-            "order_size":          ORDER_SIZE,
-            "max_inventory":       MAX_INVENTORY,
-            "refresh_interval_ms": REFRESH_INTERVAL_MS,
-            "edge_threshold":      EDGE_THRESHOLD,
-            "inventory_skew":      INVENTORY_SKEW,
-            "min_price":           MIN_PRICE,
-            "max_price":           MAX_PRICE,
-            "stop_before_end_ms":  STOP_BEFORE_END_MS,
-            "max_loss":            MAX_LOSS,
+            "target_spread":         TARGET_SPREAD,
+            "order_size":            ORDER_SIZE,
+            "max_inventory":         MAX_INVENTORY,
+            "refresh_interval_ms":   REFRESH_INTERVAL_MS,
+            "edge_threshold":        EDGE_THRESHOLD,
+            "inventory_skew":        INVENTORY_SKEW,
+            "min_price":             MIN_PRICE,
+            "max_price":             MAX_PRICE,
+            "stop_before_end_ms":    STOP_BEFORE_END_MS,
+            "max_loss":              MAX_LOSS,
+            "sell_side_enabled":     SELL_SIDE_ENABLED,
+            "min_inventory_to_sell": MIN_INVENTORY_TO_SELL,
+            "ask_offset_multiplier": ASK_OFFSET_MULTIPLIER,
         },
     }
 
@@ -747,8 +804,11 @@ def make_spread_app(engine: SpreadCaptureEngine) -> web.Application:
                 "inventory_skew":      sc.INVENTORY_SKEW,
                 "min_price":           sc.MIN_PRICE,
                 "max_price":           sc.MAX_PRICE,
-                "stop_before_end_ms":  sc.STOP_BEFORE_END_MS,
-                "max_loss":            sc.MAX_LOSS,
+                "stop_before_end_ms":    sc.STOP_BEFORE_END_MS,
+                "max_loss":              sc.MAX_LOSS,
+                "sell_side_enabled":     sc.SELL_SIDE_ENABLED,
+                "min_inventory_to_sell": sc.MIN_INVENTORY_TO_SELL,
+                "ask_offset_multiplier": sc.ASK_OFFSET_MULTIPLIER,
             }),
             content_type="application/json",
         )
@@ -770,6 +830,8 @@ def make_spread_app(engine: SpreadCaptureEngine) -> web.Application:
             "refresh_interval_ms": int, "edge_threshold": float,
             "inventory_skew": float, "min_price": float, "max_price": float,
             "stop_before_end_ms": int, "max_loss": float,
+            "sell_side_enabled": bool, "min_inventory_to_sell": int,
+            "ask_offset_multiplier": float,
         }
 
         updated = []

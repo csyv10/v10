@@ -25,6 +25,10 @@ class MarketPosition:
     up_cost: float = 0.0
     down_cost: float = 0.0
     fills: List[Fill] = field(default_factory=list)
+    # Sell-side tracking
+    up_shares_sold: int = 0
+    down_shares_sold: int = 0
+    sell_realized_pnl: float = 0.0
 
     def record_fill(self, side: str, price: float, shares: int) -> None:
         ts = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
@@ -35,6 +39,29 @@ class MarketPosition:
         else:
             self.down_shares += shares
             self.down_cost += price * shares
+
+    def record_sell(self, side: str, price: float, shares: int) -> None:
+        """Record a sell fill. Reduces inventory and tracks realized PnL."""
+        if side == "UP" and self.up_shares > 0:
+            actual = min(shares, self.up_shares)
+            cost_per_share = self.up_cost / self.up_shares
+            realized = (price - cost_per_share) * actual
+            self.up_cost -= cost_per_share * actual
+            self.up_shares -= actual
+            self.up_shares_sold += actual
+            self.sell_realized_pnl += realized
+        elif side == "DOWN" and self.down_shares > 0:
+            actual = min(shares, self.down_shares)
+            cost_per_share = self.down_cost / self.down_shares
+            realized = (price - cost_per_share) * actual
+            self.down_cost -= cost_per_share * actual
+            self.down_shares -= actual
+            self.down_shares_sold += actual
+            self.sell_realized_pnl += realized
+        else:
+            return
+        ts = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
+        self.fills.append(Fill(side=side, price=price, shares=actual, direction="SELL", ts=ts))
 
     @property
     def total_cost(self) -> float:
@@ -98,12 +125,17 @@ class PositionTracker:
             self._markets_traded += 1
             self._current = MarketPosition()
 
-    def record_fill(self, side: str, price: float, shares: int) -> None:
+def record_fill(self, side: str, price: float, shares: int) -> None:
         with self._lock:
             self._current.record_fill(side, price, shares)
             self._trade_count += 1
             if self._current.total_cost > self._peak_cost:
                 self._peak_cost = self._current.total_cost
+
+    def record_sell(self, side: str, price: float, shares: int) -> None:
+        with self._lock:
+            self._current.record_sell(side, price, shares)
+            self._trade_count += 1
 
     def reconcile(self, up_shares: int, up_cost: float,
                   down_shares: int, down_cost: float) -> tuple[int, int]:
@@ -162,8 +194,13 @@ class PositionTracker:
             return self._realised_pnl
 
     @property
+    def sell_realized_pnl(self) -> float:
+        with self._lock:
+            return self._current.sell_realized_pnl
+
+    @property
     def total_pnl(self) -> float:
-        return self.realised_pnl + self.unrealised_pnl
+        return self.realised_pnl + self.unrealised_pnl + self.sell_realized_pnl
 
     @property
     def trade_count(self) -> int:

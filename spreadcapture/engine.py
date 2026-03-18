@@ -208,9 +208,15 @@ class SpreadCaptureEngine:
             if signal is not None:
                 self.current_quotes = signal
                 self._place_paper_orders(signal)
+                ask_info = ""
+                if signal.has_asks:
+                    ask_info = (
+                        f" | ASK UP@{signal.ask_up:.2f}×{signal.size_ask_up}"
+                        f" DN@{signal.ask_down:.2f}×{signal.size_ask_down}"
+                    )
                 self.log(
-                    f"Quoted UP@{signal.quote_up:.2f}×{signal.size_up} "
-                    f"DOWN@{signal.quote_down:.2f}×{signal.size_down} "
+                    f"Quoted BID UP@{signal.quote_up:.2f}×{signal.size_up} "
+                    f"DN@{signal.quote_down:.2f}×{signal.size_down}{ask_info} "
                     f"spread={signal.spread:.4f}"
                 )
             else:
@@ -223,11 +229,13 @@ class SpreadCaptureEngine:
     # ── Paper order placement ─────────────────────────────────────────────
 
     def _place_paper_orders(self, signal: QuoteSignal) -> None:
-        """Record passive bid orders (paper mode). Fills are simulated on tick."""
+        """Record passive bid AND ask orders (paper mode). Fills are simulated on tick."""
         import uuid
+        # Bid (buy) orders
         if signal.size_up > 0:
             self._paper_orders.append({
                 "order_id": f"paper-{uuid.uuid4().hex[:12]}",
+                "direction": "BUY",
                 "side": "UP",
                 "price": signal.quote_up,
                 "size": signal.size_up,
@@ -236,17 +244,37 @@ class SpreadCaptureEngine:
         if signal.size_down > 0:
             self._paper_orders.append({
                 "order_id": f"paper-{uuid.uuid4().hex[:12]}",
+                "direction": "BUY",
                 "side": "DOWN",
                 "price": signal.quote_down,
                 "size": signal.size_down,
+                "token_id": self._current_pair.down_token_id if self._current_pair else "",
+            })
+        # Ask (sell) orders – only if we hold inventory
+        if signal.size_ask_up > 0:
+            self._paper_orders.append({
+                "order_id": f"paper-{uuid.uuid4().hex[:12]}",
+                "direction": "SELL",
+                "side": "UP",
+                "price": signal.ask_up,
+                "size": signal.size_ask_up,
+                "token_id": self._current_pair.up_token_id if self._current_pair else "",
+            })
+        if signal.size_ask_down > 0:
+            self._paper_orders.append({
+                "order_id": f"paper-{uuid.uuid4().hex[:12]}",
+                "direction": "SELL",
+                "side": "DOWN",
+                "price": signal.ask_down,
+                "size": signal.size_ask_down,
                 "token_id": self._current_pair.down_token_id if self._current_pair else "",
             })
 
     def _simulate_paper_fills(self) -> None:
         """Check if any resting paper orders have been crossed by the market.
 
-        A passive BUY limit at price P fills when the best ask drops to ≤ P
-        (a seller is now willing to trade at our price).
+        BUY limit at price P fills when best ask ≤ P (seller meets our bid).
+        SELL limit at price P fills when best bid ≥ P (buyer meets our ask).
         """
         if not self._paper_orders:
             return
@@ -256,42 +284,58 @@ class SpreadCaptureEngine:
         filled_ids = []
         for order in self._paper_orders:
             ob = self.ob_up if order["side"] == "UP" else self.ob_down
-            best_ask = ob.best_ask
-            ask_size = ob.best_ask_size
+            direction = order.get("direction", "BUY")
 
-            if best_ask is None:
+            if direction == "BUY":
+                best_price = ob.best_ask
+                best_size = ob.best_ask_size
+                triggered = best_price is not None and best_price <= order["price"]
+            else:  # SELL
+                best_price = ob.best_bid
+                best_size = ob.best_bid_size
+                triggered = best_price is not None and best_price >= order["price"]
+
+            if not triggered:
                 continue
 
-            if best_ask <= order["price"]:
-                # Market has moved to fill our passive bid
+            fill_qty = order["size"]
+            if best_size and best_size > 0:
+                fill_qty = min(fill_qty, int(best_size))
+            if fill_qty <= 0:
                 fill_qty = order["size"]
-                if ask_size > 0:
-                    fill_qty = min(fill_qty, int(ask_size))
-                if fill_qty <= 0:
-                    fill_qty = order["size"]
 
+            if direction == "BUY":
                 self.tracker.record_fill(order["side"], order["price"], fill_qty)
-                self.total_fills += 1
-
-                fill_rec = {
-                    "side": order["side"],
-                    "price": order["price"],
-                    "shares": fill_qty,
-                    "time": datetime.now(tz=timezone.utc).strftime("%H:%M:%S"),
-                }
-                self.recent_fills.appendleft(fill_rec)
                 self.log(
-                    f"[FILL] {order['side']} {fill_qty}sh @ {order['price']:.2f}"
-                    f"  (ask was {best_ask:.2f})"
+                    f"[BUY FILL] {order['side']} {fill_qty}sh @ {order['price']:.2f}"
+                    f"  (ask was {best_price:.2f})"
+                )
+            else:
+                self.tracker.record_sell(order["side"], order["price"], fill_qty)
+                sell_pnl = self.tracker.position.sell_realized_pnl
+                self.log(
+                    f"[SELL FILL] {order['side']} {fill_qty}sh @ {order['price']:.2f}"
+                    f"  (bid was {best_price:.2f})"
+                    f"  realized PnL: ${self.tracker.sell_realized_pnl:.4f}"
                 )
 
-                # Check if loss limit hit after fill
-                pnl = self.tracker.total_pnl
-                from spreadcapture.config import MAX_LOSS
-                if pnl < -MAX_LOSS:
-                    self.risk.halt(f"Loss limit: PnL=${pnl:.2f}")
+            self.total_fills += 1
+            fill_rec = {
+                "direction": direction,
+                "side": order["side"],
+                "price": order["price"],
+                "shares": fill_qty,
+                "time": datetime.now(tz=timezone.utc).strftime("%H:%M:%S"),
+            }
+            self.recent_fills.appendleft(fill_rec)
 
-                filled_ids.append(order["order_id"])
+            # Check loss limit
+            pnl = self.tracker.total_pnl
+            from spreadcapture.config import MAX_LOSS
+            if pnl < -MAX_LOSS:
+                self.risk.halt(f"Loss limit: PnL=${pnl:.2f}")
+
+            filled_ids.append(order["order_id"])
 
         self._paper_orders = [o for o in self._paper_orders if o["order_id"] not in filled_ids]
 
