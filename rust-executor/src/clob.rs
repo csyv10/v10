@@ -1,16 +1,36 @@
 //! CLOB API client — handles all HTTP communication with Polymarket.
 //!
-//! Replaces py_clob_client with direct reqwest calls for maximum speed.
+//! Order types:
+//!   - Maker BUY: GTC post_only (0% fee, retry with fresh price)
+//!   - Maker TP SELL: GTC post_only @TP-price (0% fee, posted after settlement)
+//!   - FAK SL SELL: Fill-And-Kill taker @bid-1tick (immediate exit)
 
 use crate::types::{BalanceResponse, OrderResponse, OrderStatus};
 use hmac::{Hmac, Mac};
 use reqwest::Client;
+use serde_json::json;
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CLOB_HOST: &str = "https://clob.polymarket.com";
+const TICK_SIZE: &str = "0.01";
+const FEE_RATE_BPS: u32 = 1000;
 
 type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Clone, Copy, Debug)]
+pub enum OrderType {
+    /// Good-Til-Cancelled, post_only = true (maker only)
+    GtcMaker,
+    /// Fill-And-Kill (taker, immediate)
+    Fak,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum OrderSide {
+    Buy,
+    Sell,
+}
 
 /// Polymarket CLOB API client
 pub struct ClobClient {
@@ -18,10 +38,18 @@ pub struct ClobClient {
     api_key: String,
     api_secret: String,
     api_passphrase: String,
+    wallet_address: String,
+    private_key: String,
 }
 
 impl ClobClient {
-    pub fn new(api_key: String, api_secret: String, api_passphrase: String) -> Self {
+    pub fn new(
+        api_key: String,
+        api_secret: String,
+        api_passphrase: String,
+        wallet_address: String,
+        private_key: String,
+    ) -> Self {
         let http = Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .pool_max_idle_per_host(10)
@@ -33,6 +61,8 @@ impl ClobClient {
             api_key,
             api_secret,
             api_passphrase,
+            wallet_address,
+            private_key,
         }
     }
 
@@ -72,6 +102,30 @@ impl ClobClient {
         resp.text().await
     }
 
+    /// POST with L2 auth
+    async fn post_authenticated(
+        &self,
+        url: &str,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<String, String> {
+        let mut req = self.http.post(url);
+        for (k, v) in self.auth_headers("POST", path) {
+            req = req.header(&k, &v);
+        }
+        req = req.header("Content-Type", "application/json");
+        req = req.json(body);
+
+        let resp = req.send().await.map_err(|e| format!("POST failed: {}", e))?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| format!("read body: {}", e))?;
+
+        if !status.is_success() {
+            return Err(format!("HTTP {}: {}", status, &text[..text.len().min(300)]));
+        }
+        Ok(text)
+    }
+
     /// Check CLOB connectivity
     pub async fn ping(&self) -> Result<(), String> {
         let resp = self
@@ -85,6 +139,62 @@ impl ClobClient {
         } else {
             Err(format!("CLOB ping status: {}", resp.status()))
         }
+    }
+
+    /// Place an order on CLOB
+    ///
+    /// For maker BUY/TP: order_type = GtcMaker
+    /// For SL sell: order_type = Fak
+    pub async fn place_order(
+        &self,
+        token_id: &str,
+        price: f64,
+        size: f64,
+        side: OrderSide,
+        order_type: OrderType,
+    ) -> Result<OrderResponse, String> {
+        // TODO: This is a placeholder. Full implementation requires:
+        // 1. EIP-712 order signing with private key
+        // 2. Building the signed order struct
+        // 3. POST to /order endpoint
+        //
+        // For now, we delegate order signing to py_clob_client
+        // and only handle the HTTP layer in Rust.
+        //
+        // The real speedup comes from:
+        // - Persistent HTTP connections (reqwest connection pool)
+        // - Tokio async (no GIL blocking)
+        // - Settlement polling in parallel
+
+        let (order_type_str, post_only) = match order_type {
+            OrderType::GtcMaker => ("GTC", true),
+            OrderType::Fak => ("FAK", false),
+        };
+
+        let side_str = match side {
+            OrderSide::Buy => "BUY",
+            OrderSide::Sell => "SELL",
+        };
+
+        println!(
+            "[RustExecutor] {} {} {} @ {:.4} size={:.2} type={}",
+            side_str,
+            if post_only { "maker" } else { "taker" },
+            token_id.get(..16).unwrap_or(token_id),
+            price,
+            size,
+            order_type_str
+        );
+
+        // Placeholder — return unfilled until signing is implemented
+        Ok(OrderResponse {
+            error_msg: Some("signing not yet implemented in Rust".into()),
+            order_id: None,
+            taking_amount: None,
+            making_amount: None,
+            status: None,
+            success: Some(false),
+        })
     }
 
     /// Update balance allowance — triggers CLOB to re-scan chain
@@ -140,5 +250,20 @@ impl ClobClient {
             .await
             .map_err(|e| format!("cancel: {}", e))?;
         Ok(())
+    }
+
+    /// Get orderbook for a token (for maker price calculation)
+    pub async fn get_orderbook(&self, token_id: &str) -> Result<serde_json::Value, String> {
+        let url = format!("{}/book?token_id={}", CLOB_HOST, token_id);
+        let body = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("orderbook: {}", e))?
+            .text()
+            .await
+            .map_err(|e| format!("orderbook body: {}", e))?;
+        serde_json::from_str(&body).map_err(|e| format!("parse orderbook: {}", e))
     }
 }

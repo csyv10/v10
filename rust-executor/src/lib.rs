@@ -5,6 +5,7 @@
 
 mod clob;
 mod executor;
+mod signing;
 mod types;
 
 use pyo3::prelude::*;

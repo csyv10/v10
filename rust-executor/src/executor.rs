@@ -42,8 +42,8 @@ pub struct RustExecutor {
 #[pymethods]
 impl RustExecutor {
     #[new]
-    #[pyo3(signature = (api_key="".to_string(), api_secret="".to_string(), api_passphrase="".to_string(), live=false))]
-    fn new(api_key: String, api_secret: String, api_passphrase: String, live: bool) -> Self {
+    #[pyo3(signature = (api_key="".to_string(), api_secret="".to_string(), api_passphrase="".to_string(), wallet_address="".to_string(), private_key="".to_string(), live=false))]
+    fn new(api_key: String, api_secret: String, api_passphrase: String, wallet_address: String, private_key: String, live: bool) -> Self {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(4)
@@ -53,7 +53,7 @@ impl RustExecutor {
         );
 
         let client = if live && !api_key.is_empty() {
-            let c = ClobClient::new(api_key, api_secret, api_passphrase);
+            let c = ClobClient::new(api_key, api_secret, api_passphrase, wallet_address, private_key);
             // Verify connection
             let rt = runtime.clone();
             match rt.block_on(c.ping()) {
