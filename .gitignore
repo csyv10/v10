@@ -1,4 +1,4 @@
-# Environment / secrets
+h# Environment / secrets
 .env
 
 # Python
@@ -12,6 +12,7 @@ dist/
 build/
 .eggs/
 
+
 # Logs
 *.log
 
@@ -24,3 +25,4 @@ env/
 .vscode/
 *.code-workspace
 .idea/
+pairbot-code.tar.gz

@@ -129,6 +129,69 @@ body{background:var(--bg);color:var(--text);font-family:'Cascadia Code',Consolas
 .hdr-btn{background:none;border:1px solid var(--border);color:var(--muted);cursor:pointer;font:inherit;font-size:11px;letter-spacing:.3px;padding:3px 10px;border-radius:3px}
 .hdr-btn:hover{border-color:var(--text);color:var(--text)}
 .hdr-btn.pause-active{border-color:var(--yellow);color:var(--yellow)}
+
+/* ── Mobile responsive ── */
+@media(max-width:600px){
+  /* Header: wrap items, bigger touch targets */
+  #hdr{flex-wrap:wrap;padding:8px 10px;gap:8px}
+  #hdr .name{font-size:11px;width:100%;text-align:center}
+  #hdr .status{font-size:12px;order:1}
+  #hdr .pnl{font-size:13px;min-width:auto;order:2}
+  .hdr-btn{font-size:13px;padding:10px 18px;min-height:44px;min-width:44px;border-radius:6px;touch-action:manipulation}
+  #h-paper{order:0}
+  #ul-tabs{order:3;width:100%;justify-content:center}
+  #ul-tabs .hdr-btn{flex:1;text-align:center}
+
+  /* Tab navigation: bigger touch targets */
+  #tab-nav{padding:0 8px;gap:0}
+  .tab-btn{font-size:13px;padding:12px 16px;min-height:48px;flex:1;text-align:center;touch-action:manipulation}
+
+  /* Orderbook section: stack vertically */
+  #ob-section{grid-template-columns:1fr;height:auto}
+  #pnl-panel{order:0}
+  #ob-up{order:1;min-height:180px}
+  #ob-dn{order:2;min-height:180px}
+  #info{font-size:13px}
+  .ob-row{grid-template-columns:42px 1fr 1fr;padding:4px 10px;min-height:32px;align-items:center}
+  .price-bar{padding:8px 10px}
+
+  /* Stats boxes: stack single column */
+  #stats-section{grid-template-columns:1fr}
+  .stat-box{padding:12px 16px}
+  .stat-value{font-size:22px}
+
+  /* Charts: taller on mobile */
+  .chart-wrap{height:160px}
+  .chart-box{padding:10px}
+
+  /* Per-market stats: 3-col is ok but increase padding */
+  #mkt-stats-grid{font-size:13px}
+  #mkt-stats-grid .mg-cell{padding:6px 8px}
+
+  /* Trades: bigger rows */
+  .trade-row{padding:8px 12px;min-height:44px;align-items:center}
+  .tr-side{font-size:13px}
+  .tr-price{font-size:13px}
+
+  /* Log */
+  #log-panel{height:180px}
+  #log-body{font-size:12px}
+  .ll{padding:3px 0}
+
+  /* Settings: bigger inputs and buttons */
+  #tab-settings{padding:16px 12px;max-width:100%}
+  .s-input,.s-select{font-size:16px;padding:10px 12px;min-height:44px;border-radius:6px}
+  .toggle-btn{font-size:14px;padding:12px;min-height:48px;border-radius:6px;touch-action:manipulation}
+  .s-save{font-size:15px;padding:14px;min-height:52px;border-radius:8px;touch-action:manipulation}
+  .s-label{font-size:13px;margin-bottom:6px}
+  .mode-btns,.timing-btns{gap:10px}
+
+  /* General: prevent iOS zoom on focus */
+  input,select,textarea{font-size:16px!important}
+
+  /* Larger base font for readability */
+  body{font-size:14px}
+}
 </style>
 </head>
 <body>
