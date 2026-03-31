@@ -324,6 +324,7 @@ impl ClobClient {
     }
 
     /// Get orderbook
+    #[allow(dead_code)]
     pub async fn get_orderbook(&self, token_id: &str) -> Result<serde_json::Value, String> {
         let url = format!("{}/book?token_id={}", CLOB_HOST, token_id);
         let body = self

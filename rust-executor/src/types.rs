@@ -1,7 +1,7 @@
 //! Shared types — mirrors Python FillResult and order structs.
 
 use pyo3::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// Result of an order execution — returned to Python.
 #[pyclass]
@@ -57,6 +57,7 @@ impl FillResult {
 }
 
 /// CLOB API response for order placement
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderResponse {
@@ -80,6 +81,7 @@ pub struct OrderStatus {
     pub price: Option<String>,
 }
 
+#[allow(dead_code)]
 impl OrderStatus {
     pub fn matched_qty(&self) -> f64 {
         self.size_matched
@@ -127,12 +129,14 @@ impl BalanceResponse {
 }
 
 /// Side of a trade
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
     Up,
     Down,
 }
 
+#[allow(dead_code)]
 impl Side {
     pub fn as_str(&self) -> &'static str {
         match self {

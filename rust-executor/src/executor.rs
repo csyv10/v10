@@ -5,7 +5,7 @@
 //! Rust handles: CLOB communication, settlement polling, order management.
 
 use crate::clob::ClobClient;
-use crate::types::{FillResult, OrderResponse, Side};
+use crate::types::{FillResult, OrderResponse};
 use dashmap::DashMap;
 use pyo3::prelude::*;
 use std::sync::Arc;
@@ -13,11 +13,9 @@ use std::time::Instant;
 use tokio::runtime::Runtime;
 
 /// Safety caps (mirrors Python constants)
-const MAX_SINGLE_ORDER_USD: f64 = 8.0;
 const MAX_OPEN_EXPOSURE_USD: f64 = 20.0;
 const SETTLEMENT_POLL_INTERVAL_MS: u64 = 200;
 const SETTLEMENT_MAX_PRIMES: u32 = 15;
-const FORCE_SELL_TIMEOUT_S: f64 = 8.0;
 
 #[pyclass]
 pub struct RustExecutor {
@@ -35,8 +33,6 @@ pub struct RustExecutor {
     token_position_cost: DashMap<String, f64>,
     settlement_confirmed: DashMap<String, bool>,
 
-    // In-flight guard
-    buy_in_flight: DashMap<String, bool>,
 }
 
 #[pymethods]
@@ -81,7 +77,6 @@ impl RustExecutor {
             token_position_qty: DashMap::new(),
             token_position_cost: DashMap::new(),
             settlement_confirmed: DashMap::new(),
-            buy_in_flight: DashMap::new(),
         }
     }
 
@@ -431,7 +426,7 @@ fn parse_fak_response(
     action: &str,
     side: &str,
     price: f64,
-    size: f64,
+    _size: f64,
     t0: std::time::Instant,
 ) -> FillResult {
     let latency = t0.elapsed().as_millis() as f64;
