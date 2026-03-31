@@ -5,7 +5,7 @@
 //! Rust handles: CLOB communication, settlement polling, order management.
 
 use crate::clob::ClobClient;
-use crate::types::{FillResult, Side};
+use crate::types::{FillResult, OrderResponse, Side};
 use dashmap::DashMap;
 use pyo3::prelude::*;
 use std::sync::Arc;
@@ -302,6 +302,118 @@ impl RustExecutor {
         self.open_exposure + usd <= MAX_OPEN_EXPOSURE_USD
     }
 
+    /// Place a maker BUY order (GTC post_only)
+    /// Returns FillResult
+    fn place_maker_buy(&self, side: &str, token_id: &str, price: f64, size: f64) -> FillResult {
+        if let Some(ref client) = self.client {
+            let client = client.clone();
+            let tid = token_id.to_string();
+            let t0 = std::time::Instant::now();
+
+            match self.runtime.block_on(async move {
+                client
+                    .place_order(
+                        &tid,
+                        price,
+                        size,
+                        crate::clob::OrderSide::Buy,
+                        crate::clob::OrderType::GtcMaker,
+                    )
+                    .await
+            }) {
+                Ok(resp) => parse_fak_response(resp, "BUY", side, price, size, t0),
+                Err(e) => {
+                    println!("[Rust] BUY {} error: {}", side, &e[..e.len().min(200)]);
+                    FillResult {
+                        filled: false,
+                        reason: format!("BUY_ERROR: {}", &e[..e.len().min(100)]),
+                        ..FillResult::default()
+                    }
+                }
+            }
+        } else {
+            FillResult {
+                filled: false,
+                reason: "PAPER_MODE".into(),
+                ..FillResult::default()
+            }
+        }
+    }
+
+    /// Place a FAK SELL order (taker, immediate)
+    fn place_fak_sell(&self, side: &str, token_id: &str, price: f64, size: f64) -> FillResult {
+        if let Some(ref client) = self.client {
+            let client = client.clone();
+            let tid = token_id.to_string();
+            let t0 = std::time::Instant::now();
+
+            match self.runtime.block_on(async move {
+                client
+                    .place_order(
+                        &tid,
+                        price,
+                        size,
+                        crate::clob::OrderSide::Sell,
+                        crate::clob::OrderType::Fak,
+                    )
+                    .await
+            }) {
+                Ok(resp) => parse_fak_response(resp, "SELL", side, price, size, t0),
+                Err(e) => {
+                    println!("[Rust] SELL {} error: {}", side, &e[..e.len().min(200)]);
+                    FillResult {
+                        filled: false,
+                        reason: format!("SELL_ERROR: {}", &e[..e.len().min(100)]),
+                        ..FillResult::default()
+                    }
+                }
+            }
+        } else {
+            FillResult {
+                filled: false,
+                reason: "PAPER_MODE".into(),
+                ..FillResult::default()
+            }
+        }
+    }
+
+    /// Place a maker TP SELL order (GTC post_only)
+    fn place_maker_tp_sell(&self, side: &str, token_id: &str, price: f64, size: f64) -> FillResult {
+        if let Some(ref client) = self.client {
+            let client = client.clone();
+            let tid = token_id.to_string();
+            let t0 = std::time::Instant::now();
+
+            match self.runtime.block_on(async move {
+                client
+                    .place_order(
+                        &tid,
+                        price,
+                        size,
+                        crate::clob::OrderSide::Sell,
+                        crate::clob::OrderType::GtcMaker,
+                    )
+                    .await
+            }) {
+                Ok(resp) => parse_fak_response(resp, "SELL_TP", side, price, size, t0),
+                Err(e) => {
+                    println!("[Rust] SELL_TP {} error: {}", side, &e[..e.len().min(200)]);
+                    FillResult {
+                        filled: false,
+                        reason: format!("SELL_TP_ERROR: {}", &e[..e.len().min(100)]),
+                        ..FillResult::default()
+                    }
+                }
+            }
+        } else {
+            FillResult {
+                filled: false,
+                reason: "PAPER_MODE".into(),
+                ..FillResult::default()
+            }
+        }
+    }
+
     /// Mode string
     #[getter]
     fn mode(&self) -> &str {
@@ -309,6 +421,83 @@ impl RustExecutor {
             "LIVE"
         } else {
             "PAPER"
+        }
+    }
+}
+
+/// Parse FAK/GTC order response into FillResult
+fn parse_fak_response(
+    resp: OrderResponse,
+    action: &str,
+    side: &str,
+    price: f64,
+    size: f64,
+    t0: std::time::Instant,
+) -> FillResult {
+    let latency = t0.elapsed().as_millis() as f64;
+
+    let taking = resp
+        .taking_amount
+        .as_ref()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let making = resp
+        .making_amount
+        .as_ref()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+
+    if taking > 0.0 || making > 0.0 {
+        // Deterministic parsing:
+        // BUY:  takingAmount = shares received, makingAmount = USDC spent
+        // SELL: takingAmount = USDC received,   makingAmount = shares given
+        let (shares, usdc) = if action.starts_with("SELL") {
+            (making, taking) // SELL: making=shares, taking=USDC
+        } else {
+            (taking, making) // BUY: taking=shares, making=USDC
+        };
+
+        let fill_price = if shares > 0.0 {
+            (usdc / shares).min(1.0)
+        } else {
+            price
+        };
+
+        let oid = resp.order_id.as_deref().unwrap_or("?");
+        println!(
+            "[Rust] {} {} FILLED: {:.4} @ {:.4} ${:.2} {}ms",
+            action, side, shares, fill_price, usdc, latency
+        );
+
+        FillResult {
+            filled: true,
+            fill_price,
+            filled_qty: shares,
+            total_cost: usdc,
+            latency_ms: latency,
+            reason: format!("RUST_{}_FILLED id={}", action, &oid[..oid.len().min(20)]),
+        }
+    } else if resp
+        .success
+        .unwrap_or(false)
+    {
+        // GTC order posted, not yet filled — return order_id for polling
+        let oid = resp.order_id.unwrap_or_default();
+        println!("[Rust] {} {} POSTED id={} {}ms", action, side, &oid[..oid.len().min(20)], latency);
+        FillResult {
+            filled: false,
+            latency_ms: latency,
+            reason: format!("POSTED id={}", oid),
+            ..FillResult::default()
+        }
+    } else {
+        let err = resp.error_msg.unwrap_or_default();
+        println!("[Rust] {} {} FAILED: {} {}ms", action, side, &err[..err.len().min(100)], latency);
+        FillResult {
+            filled: false,
+            latency_ms: latency,
+            reason: format!("FAILED: {}", &err[..err.len().min(100)]),
+            ..FillResult::default()
         }
     }
 }

@@ -21,6 +21,19 @@ pub struct FillResult {
     pub reason: String,
 }
 
+impl FillResult {
+    pub fn default() -> Self {
+        Self {
+            filled: false,
+            fill_price: 0.0,
+            filled_qty: 0.0,
+            total_cost: 0.0,
+            latency_ms: 0.0,
+            reason: String::new(),
+        }
+    }
+}
+
 #[pymethods]
 impl FillResult {
     #[new]
