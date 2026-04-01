@@ -84,7 +84,7 @@ class LiveExecutor:
         api_key = os.environ.get("POLY_API_KEY", "")
         api_secret = os.environ.get("POLY_API_SECRET", "")
         api_passphrase = os.environ.get("POLY_API_PASSPHRASE", "")
-        wallet_address = os.environ.get("POLY_WALLET", "")
+        wallet_address = os.environ.get("POLY_WALLET_ADDRESS", os.environ.get("POLY_WALLET", ""))
         private_key = os.environ.get("POLY_PRIVATE_KEY", "")
         live_trading = os.environ.get("LIVE_TRADING", "false").lower() == "true"
 

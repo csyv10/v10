@@ -61,6 +61,13 @@ impl ClobClient {
             .build()
             .expect("Failed to build HTTP client");
 
+        // EIP-55 checksum the wallet address
+        let wallet_address = if wallet_address.starts_with("0x") || wallet_address.starts_with("0X") {
+            to_checksum_address(&wallet_address)
+        } else {
+            wallet_address
+        };
+
         Self {
             http,
             api_key,
@@ -192,52 +199,51 @@ impl ClobClient {
             OrderType::Fak => ("FAK", false),
         };
 
-        // Calculate maker/taker amounts (mirrors Python get_order_amounts)
-        let rounded_price = (price * 100.0).round() / 100.0; // 2 decimal places
-        let rounded_size = ((size * 100.0).floor()) / 100.0;  // floor to 2 decimals
+        // Calculate maker/taker amounts
+        // Must match Python py_clob_client exactly to produce valid signatures.
+        // Use string-based decimal math to avoid floating point drift.
+        let price_cents = (price * 100.0).round() as u64;  // price in cents (2dp)
+        let size_cents = (size * 100.0).round() as u64;     // size rounded to 2dp
 
         let (maker_amount, taker_amount) = match side {
             OrderSide::Buy => {
-                // BUY: maker=USDC, taker=shares
-                let taker = (rounded_size * TOKEN_DECIMALS) as u128;
-                let maker_raw = rounded_size * rounded_price;
-                let maker = (maker_raw * TOKEN_DECIMALS).round() as u128;
+                // BUY: taker=shares (size * 1e6), maker=USDC (size * price * 1e6)
+                let taker = (size_cents as u128) * 10000;   // size_cents * 1e6 / 1e2
+                let maker = (size_cents as u128) * (price_cents as u128) * 100; // size*price*1e6
                 (maker, taker)
             }
             OrderSide::Sell => {
-                // SELL: maker=shares, taker=USDC
-                let maker = (rounded_size * TOKEN_DECIMALS) as u128;
-                let taker_raw = rounded_size * rounded_price;
-                let taker = (taker_raw * TOKEN_DECIMALS).round() as u128;
+                // SELL: maker=shares (size * 1e6), taker=USDC (size * price * 1e6)
+                let maker = (size_cents as u128) * 10000;
+                let taker = (size_cents as u128) * (price_cents as u128) * 100;
                 (maker, taker)
             }
         };
-
-        // Parse token_id to u128
-        let token_id_num: u128 = token_id.parse().map_err(|e| format!("bad token_id: {}", e))?;
 
         // Build and sign the order
         let salt = generate_salt();
         let order_params = OrderParams {
             salt,
-            maker: self.wallet_address.clone(),
-            signer: self.signer_address.clone(),
+            maker: self.wallet_address.clone(),    // funder/proxy address (holds USDC)
+            signer: self.signer_address.clone(),  // EOA that signs
             taker: ZERO_ADDRESS.into(),
-            token_id: token_id_num,
+            token_id: token_id.to_string(),
             maker_amount,
             taker_amount,
             expiration: 0,
             nonce: 0,
             fee_rate_bps: FEE_RATE_BPS,
             side: side_int,
-            signature_type: 1, // POLY_PROXY
+            signature_type: 1, // POLY_PROXY: sign with key, settle from funder wallet
         };
 
         let signature = sign_order(&order_params, &self.private_key)?;
 
-        // Build the order JSON (matches Python order.dict() format)
+        // Build the order JSON (matches Python order.dict() format exactly)
+        // Python py_clob_client sends: salt=int, side="0"/"1", signatureType=0
+        // maker = funder/proxy (where USDC is), signer = EOA
         let order_json = json!({
-            "salt": salt.to_string(),
+            "salt": salt,
             "maker": &self.wallet_address,
             "signer": &self.signer_address,
             "taker": ZERO_ADDRESS,
@@ -262,14 +268,25 @@ impl ClobClient {
         // Serialize deterministically (no spaces, like Python separators=(",",":"))
         let body_str = serde_json::to_string(&body).map_err(|e| format!("serialize: {}", e))?;
 
+        // Log to file for debugging (journald truncates)
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true).append(true)
+            .open("/opt/pairbot/pair_engine_package/rust_orders.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "---\n{}", &body_str);
+        }
+
         println!(
-            "[Rust] {} {} {} @ {:.4} size={:.2} type={}",
+            "[Rust] {} {} {} @ {:.4} size={:.2} type={} maker={} taker={}",
             side_str,
             if post_only { "maker" } else { "taker" },
-            &token_id[..16.min(token_id.len())],
+            &token_id[..20.min(token_id.len())],
             price,
             size,
             type_str,
+            maker_amount,
+            taker_amount,
         );
 
         // POST to CLOB
@@ -341,6 +358,31 @@ impl ClobClient {
 }
 
 /// Derive Ethereum address from private key
+/// EIP-55 checksum encoding for Ethereum addresses
+fn to_checksum_address(addr: &str) -> String {
+    let addr_lower = addr.strip_prefix("0x").unwrap_or(addr).to_lowercase();
+
+    use sha3::{Digest, Keccak256};
+    let hash = Keccak256::digest(addr_lower.as_bytes());
+    let hash_hex = hex::encode(hash);
+
+    let mut result = String::with_capacity(42);
+    result.push_str("0x");
+    for (i, c) in addr_lower.chars().enumerate() {
+        if c.is_ascii_alphabetic() {
+            let hash_nibble = u8::from_str_radix(&hash_hex[i..i + 1], 16).unwrap_or(0);
+            if hash_nibble >= 8 {
+                result.push(c.to_ascii_uppercase());
+            } else {
+                result.push(c);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 fn derive_address(private_key: &str) -> String {
     let key_hex = private_key.strip_prefix("0x").unwrap_or(private_key);
     let key_bytes = hex::decode(key_hex).unwrap_or_default();
@@ -357,5 +399,6 @@ fn derive_address(private_key: &str) -> String {
 
     use sha3::{Digest, Keccak256};
     let hash = Keccak256::digest(public_bytes);
-    format!("0x{}", hex::encode(&hash[12..]))
+    let addr_hex = hex::encode(&hash[12..]);
+    to_checksum_address(&addr_hex)
 }
