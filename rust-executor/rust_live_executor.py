@@ -155,19 +155,65 @@ class LiveExecutor:
             )
 
         loop = asyncio.get_event_loop()
-        rust_result = await loop.run_in_executor(
-            self._pool,
-            self._rust.place_maker_buy, side, token_id, price, qty,
-        )
 
-        fr = _rust_to_fill(rust_result, price, qty)
+        # Maker BUY: place at best_bid (below best_ask) to avoid crossing book
+        # Same logic as Python LiveExecutor: best_ask - 1tick, retry up to 5x
+        usd_budget = price * qty
 
-        if fr.filled:
-            self._rust.record_buy(token_id, fr.filled_qty, fr.total_cost)
-            # Start settlement priming in background
-            loop.run_in_executor(self._pool, self._rust.prime_settlement, token_id)
-            self._trade_count += 1
-            self._total_latency += fr.latency_ms
+        # Find maker price from orderbook (best_ask - 1 tick)
+        maker_px = round(price - 0.01, 2)
+        if orderbook:
+            asks = orderbook.get("asks", [])
+            if asks:
+                try:
+                    sorted_asks = sorted(asks, key=lambda x: float(x.get("price", x.get("p", 99))))
+                    best_ask = float(sorted_asks[0].get("price", sorted_asks[0].get("p", 99)))
+                    maker_px = round(best_ask - 0.01, 2)
+                except (ValueError, IndexError, KeyError):
+                    pass
+
+        # Never go below strategy's entry min price
+        maker_px = max(0.02, min(0.98, maker_px))
+        maker_qty = round(usd_budget / maker_px, 2) if maker_px > 0 else qty
+
+        for attempt in range(5):
+            print(f"[Rust] BUY {side} maker attempt {attempt+1}/5 @ {maker_px:.2f} size={maker_qty:.2f}")
+
+            rust_result = await loop.run_in_executor(
+                self._pool,
+                self._rust.place_maker_buy, side, token_id, maker_px, maker_qty,
+            )
+
+            fr = _rust_to_fill(rust_result, price, qty)
+
+            if fr.filled:
+                self._rust.record_buy(token_id, fr.filled_qty, fr.total_cost)
+                loop.run_in_executor(self._pool, self._rust.prime_settlement, token_id)
+                self._trade_count += 1
+                self._total_latency += fr.latency_ms
+                return fr
+
+            # POSTED — GTC order is live on book, return as filled
+            if fr.reason.startswith("POSTED"):
+                self._rust.record_buy(token_id, maker_qty, usd_budget)
+                loop.run_in_executor(self._pool, self._rust.prime_settlement, token_id)
+                fr.filled = True
+                fr.fill_price = maker_px
+                fr.filled_qty = maker_qty
+                fr.total_cost = maker_px * maker_qty
+                return fr
+
+            # "crosses book" — our price >= ask, drop 1 tick and retry
+            if "crosses" in fr.reason.lower():
+                maker_px = round(maker_px - 0.01, 2)
+                if maker_px < 0.02:
+                    break
+                maker_qty = round(usd_budget / maker_px, 2)
+                await asyncio.sleep(0.05)
+                continue
+
+            # Other error — stop retrying
+            break
 
         return fr
 
