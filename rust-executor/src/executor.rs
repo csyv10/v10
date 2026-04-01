@@ -409,6 +409,189 @@ impl RustExecutor {
         }
     }
 
+    /// Combined settle-and-sell: waits for settlement, then fires FAK sell immediately.
+    /// All within a single Tokio task — zero Python round-trips in the critical path.
+    /// Returns FillResult with the sell outcome.
+    fn sell_immediate(
+        &self,
+        side: &str,
+        token_id: &str,
+        price: f64,
+        size: f64,
+        max_wait_s: f64,
+    ) -> FillResult {
+        if let Some(ref client) = self.client {
+            let client = client.clone();
+            let tid = token_id.to_string();
+            let side_str = side.to_string();
+            let confirmed = self.settlement_confirmed.clone();
+            let t0 = std::time::Instant::now();
+
+            self.runtime.block_on(async move {
+                let max_wait = std::time::Duration::from_secs_f64(max_wait_s);
+                let mut settled_qty: f64 = 0.0;
+
+                // Phase 1: Wait for settlement with aggressive polling
+                // First 2s: poll every 50ms (fast). After that: 200ms.
+                loop {
+                    let _ = client.update_balance_allowance(&tid, 1).await;
+                    if let Ok(bal) = client.get_balance(&tid, 1).await {
+                        if bal > 0.5 {
+                            settled_qty = bal;
+                            confirmed.insert(tid.clone(), true);
+                            let elapsed_ms = t0.elapsed().as_millis();
+                            println!(
+                                "[Rust] {} settlement confirmed: {:.2} shares ({}ms)",
+                                side_str, bal, elapsed_ms
+                            );
+                            break;
+                        }
+                    }
+
+                    if t0.elapsed() > max_wait {
+                        println!(
+                            "[Rust] {} settlement timeout after {:.1}s",
+                            side_str, t0.elapsed().as_secs_f64()
+                        );
+                        break;
+                    }
+
+                    let interval = if t0.elapsed().as_secs() < 2 { 50 } else { 200 };
+                    tokio::time::sleep(std::time::Duration::from_millis(interval)).await;
+                }
+
+                if settled_qty < 0.5 {
+                    // Force-check one more time with full balance
+                    if let Ok(bal) = client.get_balance(&tid, 1).await {
+                        if bal > 0.5 {
+                            settled_qty = bal;
+                        }
+                    }
+                }
+
+                let sell_qty = if settled_qty > 0.5 { settled_qty } else { size };
+                let settle_ms = t0.elapsed().as_millis();
+
+                // Phase 2: Fire FAK sell immediately — up to 3 retries
+                for retry in 0..3u32 {
+                    let sell_price = if retry == 0 {
+                        price
+                    } else if retry == 1 {
+                        (price - 0.02_f64).max(0.01)
+                    } else {
+                        0.01 // last resort: minimum price
+                    };
+
+                    match client
+                        .place_order(
+                            &tid,
+                            sell_price,
+                            sell_qty,
+                            crate::clob::OrderSide::Sell,
+                            crate::clob::OrderType::Fak,
+                        )
+                        .await
+                    {
+                        Ok(resp) => {
+                            let total_ms = t0.elapsed().as_millis();
+                            let result = parse_fak_response(
+                                resp,
+                                "SELL_IMM",
+                                &side_str,
+                                sell_price,
+                                sell_qty,
+                                t0,
+                            );
+                            if result.filled {
+                                println!(
+                                    "[Rust] SELL_IMM {} total: settle={}ms + order={}ms = {}ms",
+                                    side_str,
+                                    settle_ms,
+                                    total_ms - settle_ms,
+                                    total_ms,
+                                );
+                                return result;
+                            }
+                            // Not filled — check if balance issue
+                            if result.reason.contains("balance") && retry < 2 {
+                                // Wait a bit more for settlement
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                let _ = client.update_balance_allowance(&tid, 1).await;
+                                continue;
+                            }
+                            if !result.filled && retry < 2 {
+                                continue;
+                            }
+                            return result;
+                        }
+                        Err(e) => {
+                            println!(
+                                "[Rust] SELL_IMM {} retry {} error: {}",
+                                side_str,
+                                retry,
+                                &e[..e.len().min(150)]
+                            );
+                            if retry < 2 && e.contains("balance") {
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                let _ = client.update_balance_allowance(&tid, 1).await;
+                                continue;
+                            }
+                            if retry == 2 {
+                                return FillResult {
+                                    filled: false,
+                                    latency_ms: t0.elapsed().as_millis() as f64,
+                                    reason: format!("SELL_IMM_FAILED: {}", &e[..e.len().min(80)]),
+                                    ..FillResult::default()
+                                };
+                            }
+                        }
+                    }
+                }
+
+                // Last resort: fetch actual CLOB balance and sell everything at $0.01
+                let _ = client.update_balance_allowance(&tid, 1).await;
+                if let Ok(bal) = client.get_balance(&tid, 1).await {
+                    if bal > 0.5 {
+                        println!(
+                            "[Rust] SELL_IMM {} LAST RESORT: {:.2} shares @ $0.01",
+                            side_str, bal
+                        );
+                        if let Ok(resp) = client
+                            .place_order(
+                                &tid,
+                                0.01,
+                                bal,
+                                crate::clob::OrderSide::Sell,
+                                crate::clob::OrderType::Fak,
+                            )
+                            .await
+                        {
+                            let result = parse_fak_response(
+                                resp, "SELL_LAST", &side_str, 0.01, bal, t0,
+                            );
+                            if result.filled {
+                                return result;
+                            }
+                        }
+                    }
+                }
+
+                FillResult {
+                    filled: false,
+                    latency_ms: t0.elapsed().as_millis() as f64,
+                    reason: "SELL_IMM_EXHAUSTED".into(),
+                    ..FillResult::default()
+                }
+            })
+        } else {
+            FillResult {
+                filled: false,
+                reason: "PAPER_MODE".into(),
+                ..FillResult::default()
+            }
+        }
+    }
+
     /// Mode string
     #[getter]
     fn mode(&self) -> &str {

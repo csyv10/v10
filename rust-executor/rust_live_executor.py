@@ -156,11 +156,13 @@ class LiveExecutor:
 
         loop = asyncio.get_event_loop()
 
-        # Maker BUY: place at best_bid (below best_ask) to avoid crossing book
-        # Same logic as Python LiveExecutor: best_ask - 1tick, retry up to 5x
+        # Maker BUY: place at best_ask - 1tick to avoid crossing book
+        # Retry up to 5x, dropping 1 tick each time on "crosses book"
+        # HARD FLOOR: never buy below ENTRY_MIN (0.65)
+        ENTRY_MIN = 0.65
         usd_budget = price * qty
 
-        # Find maker price from orderbook (best_ask - 1 tick)
+        # Find initial maker price from orderbook
         maker_px = round(price - 0.01, 2)
         if orderbook:
             asks = orderbook.get("asks", [])
@@ -172,11 +174,10 @@ class LiveExecutor:
                 except (ValueError, IndexError, KeyError):
                     pass
 
-        # Never go below strategy's entry min price
-        maker_px = max(0.02, min(0.98, maker_px))
-        maker_qty = round(usd_budget / maker_px, 2) if maker_px > 0 else qty
-
         for attempt in range(5):
+            maker_px = max(ENTRY_MIN, min(0.98, maker_px))
+            maker_qty = round(usd_budget / maker_px, 2) if maker_px > 0 else qty
+
             print(f"[Rust] BUY {side} maker attempt {attempt+1}/5 @ {maker_px:.2f} size={maker_qty:.2f}")
 
             rust_result = await loop.run_in_executor(
@@ -193,20 +194,38 @@ class LiveExecutor:
                 self._total_latency += fr.latency_ms
                 return fr
 
-            # POSTED — GTC order is live on book, return as filled
+            # POSTED — GTC order is live on book
+            # Poll for up to 1s to see if it fills, then return
             if fr.reason.startswith("POSTED"):
-                self._rust.record_buy(token_id, maker_qty, usd_budget)
-                loop.run_in_executor(self._pool, self._rust.prime_settlement, token_id)
-                fr.filled = True
-                fr.fill_price = maker_px
-                fr.filled_qty = maker_qty
-                fr.total_cost = maker_px * maker_qty
-                return fr
+                order_id = fr.reason.replace("POSTED id=", "")
+                await asyncio.sleep(0.5)
+                status, matched, fill_px = await loop.run_in_executor(
+                    self._pool, self._rust.get_order_status, order_id,
+                )
+                if matched > 0.5:
+                    # Actually filled
+                    self._rust.record_buy(token_id, matched, fill_px * matched)
+                    loop.run_in_executor(self._pool, self._rust.prime_settlement, token_id)
+                    fr.filled = True
+                    fr.fill_price = fill_px
+                    fr.filled_qty = matched
+                    fr.total_cost = fill_px * matched
+                    self._trade_count += 1
+                    self._total_latency += fr.latency_ms
+                    return fr
+                else:
+                    # Still unfilled after 0.5s — cancel and let strategy re-evaluate
+                    await loop.run_in_executor(self._pool, self._rust.cancel_order, order_id)
+                    fr.filled = False
+                    fr.reason = "MAKER_TIMEOUT"
+                    return fr
 
             # "crosses book" — our price >= ask, drop 1 tick and retry
             if "crosses" in fr.reason.lower():
                 maker_px = round(maker_px - 0.01, 2)
-                if maker_px < 0.02:
+                if maker_px < ENTRY_MIN:
+                    # Would go below min entry — abort
+                    fr.reason = "PRICE_BELOW_ENTRY_MIN"
                     break
                 maker_qty = round(usd_budget / maker_px, 2)
                 await asyncio.sleep(0.05)
@@ -251,46 +270,21 @@ class LiveExecutor:
         loop = asyncio.get_event_loop()
 
         if stop_loss:
-            # FAK taker sell — wait for settlement first
-            settled_qty = await loop.run_in_executor(
-                self._pool,
-                self._rust.wait_for_settlement, token_id, 8.0,
-            )
-
-            sell_qty = settled_qty if settled_qty > 0.5 else qty
-            sell_price = bid_price if bid_price and bid_price > 0 else price
-
             # Cancel any pending TP for this token first
             if token_id in self._pending_tp:
                 oid = self._pending_tp.pop(token_id)
-                await loop.run_in_executor(self._pool, self._rust.cancel_order, oid)
+                loop.run_in_executor(self._pool, self._rust.cancel_order, oid)
 
+            sell_price = bid_price if bid_price and bid_price > 0 else price
+
+            # sell_immediate: settle + sell in one Rust call, zero Python round-trips
+            # Aggressive polling (50ms first 2s), 3 retries with price drops
             rust_result = await loop.run_in_executor(
                 self._pool,
-                self._rust.place_fak_sell, side, token_id, sell_price, sell_qty,
+                self._rust.sell_immediate, side, token_id, sell_price, qty, 8.0,
             )
 
             fr = _rust_to_fill(rust_result, price, qty)
-
-            if not fr.filled:
-                # Retry with aggressive price and full CLOB balance
-                balance = await loop.run_in_executor(
-                    self._pool, self._rust.get_balance, token_id,
-                )
-                if balance > 0.5:
-                    retry_price = max(0.01, sell_price - 0.02)
-                    rust_result2 = await loop.run_in_executor(
-                        self._pool,
-                        self._rust.place_fak_sell, side, token_id, retry_price, balance,
-                    )
-                    fr = _rust_to_fill(rust_result2, price, qty)
-                    if not fr.filled:
-                        # Final retry at minimum price
-                        rust_result3 = await loop.run_in_executor(
-                            self._pool,
-                            self._rust.place_fak_sell, side, token_id, 0.01, balance,
-                        )
-                        fr = _rust_to_fill(rust_result3, price, qty)
 
             if fr.filled:
                 self._rust.record_sell(token_id, fr.filled_qty, fr.total_cost)
