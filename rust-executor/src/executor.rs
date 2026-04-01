@@ -148,22 +148,24 @@ impl RustExecutor {
             let pos_qty = self.token_position_qty.clone();
 
             self.runtime.spawn(async move {
-                for _ in 0..SETTLEMENT_MAX_PRIMES {
-                    let _ = client.update_balance_allowance(&tid, 1).await;
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        SETTLEMENT_POLL_INTERVAL_MS,
-                    ))
-                    .await;
+                for i in 0..SETTLEMENT_MAX_PRIMES {
+                    // First 3: prime CLOB chain rescan. After: just poll balance.
+                    if i < 3 {
+                        let _ = client.update_balance_allowance(&tid, 1).await;
+                    }
 
-                    // Check if balance is now visible
+                    // Aggressive interval: 50ms for first 2s, then 200ms
+                    let interval = if i < 40 { 50 } else { SETTLEMENT_POLL_INTERVAL_MS };
+                    tokio::time::sleep(std::time::Duration::from_millis(interval)).await;
+
                     if let Ok(bal) = client.get_balance(&tid, 1).await {
                         let expected = pos_qty.get(&tid).map(|v| *v).unwrap_or(0.0);
                         if bal >= expected * 0.9 && bal > 0.5 {
                             confirmed.insert(tid.clone(), true);
                             println!(
-                                "[RustExecutor] ✅ Settlement confirmed: {}… ({:.4} shares)",
+                                "[RustExecutor] ✅ Settlement confirmed: {}… ({:.4} shares, poll #{})",
                                 &tid[..16.min(tid.len())],
-                                bal
+                                bal, i
                             );
                             return;
                         }
@@ -432,31 +434,38 @@ impl RustExecutor {
                 let mut settled_qty: f64 = 0.0;
 
                 // Phase 1: Wait for settlement with aggressive polling
-                // First 2s: poll every 50ms (fast). After that: 200ms.
+                // First 3 polls: update_balance_allowance + get_balance (prime the CLOB)
+                // After that: only get_balance (saves 33ms per poll)
+                // Interval: 50ms for first 2s, 150ms after
+                let mut poll_count = 0u32;
                 loop {
-                    let _ = client.update_balance_allowance(&tid, 1).await;
+                    if poll_count < 3 {
+                        // Prime: tell CLOB to rescan chain
+                        let _ = client.update_balance_allowance(&tid, 1).await;
+                    }
                     if let Ok(bal) = client.get_balance(&tid, 1).await {
                         if bal > 0.5 {
                             settled_qty = bal;
                             confirmed.insert(tid.clone(), true);
                             let elapsed_ms = t0.elapsed().as_millis();
                             println!(
-                                "[Rust] {} settlement confirmed: {:.2} shares ({}ms)",
-                                side_str, bal, elapsed_ms
+                                "[Rust] {} settlement confirmed: {:.2} shares ({}ms, {} polls)",
+                                side_str, bal, elapsed_ms, poll_count
                             );
                             break;
                         }
                     }
+                    poll_count += 1;
 
                     if t0.elapsed() > max_wait {
                         println!(
-                            "[Rust] {} settlement timeout after {:.1}s",
-                            side_str, t0.elapsed().as_secs_f64()
+                            "[Rust] {} settlement timeout after {:.1}s ({} polls)",
+                            side_str, t0.elapsed().as_secs_f64(), poll_count
                         );
                         break;
                     }
 
-                    let interval = if t0.elapsed().as_secs() < 2 { 50 } else { 200 };
+                    let interval = if t0.elapsed().as_secs() < 2 { 50 } else { 150 };
                     tokio::time::sleep(std::time::Duration::from_millis(interval)).await;
                 }
 
